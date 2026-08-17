@@ -411,6 +411,7 @@ struct IA64VpcMachineState {
     char *nvram_path;
     bool alat_full;
 
+    PCIBus *pci_bus;
     PCIDevice *ahci_dev;
     PCIDevice *ohci_dev;
     PCIDevice *uhci_dev;
@@ -700,6 +701,9 @@ static void ia64_vbe_add_oem_modes(IA64VpcMachineState *s,
     }
 }
 
+static void ia64_vpc_get_vga_bar_indices(PCIDevice *dev,
+                                         int *fb_bar, int *mmio_bar);
+
 static bool ia64_vpc_build_vbe_config(IA64VpcMachineState *s, Error **errp)
 {
     static const uint8_t native_bpps[] = { 16, 24, 32 };
@@ -708,8 +712,8 @@ static bool ia64_vpc_build_vbe_config(IA64VpcMachineState *s, Error **errp)
         IA64_VBE_NATIVE_MODE_24,
         IA64_VBE_NATIVE_MODE_32,
     };
-    PCIIORegion *fb = &s->vga_dev->io_regions[0];
-    PCIIORegion *mmio = &s->vga_dev->io_regions[2];
+    int fb_idx, mmio_idx;
+    PCIIORegion *fb, *mmio;
     qemu_edid_info edid_info = {
         .vendor = "RHT",
         .name = "QEMU IA64",
@@ -731,19 +735,15 @@ static bool ia64_vpc_build_vbe_config(IA64VpcMachineState *s, Error **errp)
                    G_N_ELEMENTS(native_bpps) <= IA64_VBE_MAX_MODES,
                    "IA-64 VBE mode array is too small");
 
+    ia64_vpc_get_vga_bar_indices(s->vga_dev, &fb_idx, &mmio_idx);
+    fb = &s->vga_dev->io_regions[fb_idx];
+    mmio = &s->vga_dev->io_regions[mmio_idx];
+
     if (fb->memory == NULL || mmio->memory == NULL) {
         error_setg(errp,
-                   "VGA device '%s' does not provide framebuffer BAR 0 and "
-                   "MMIO BAR 2 required by the IA-64 VBE bridge",
+                   "VGA device '%s' does not provide the framebuffer and "
+                   "MMIO BARs required by the IA-64 VBE bridge",
                    object_get_typename(OBJECT(s->vga_dev)));
-        return false;
-    }
-    if (fb->size > IA64_VGA_FIXED_FB_SIZE) {
-        error_setg(errp,
-                   "VGA framebuffer aperture is 0x%" PRIx64
-                   " bytes, exceeding the IA-64 fixed-window limit of "
-                   "0x%" PRIx64 " bytes",
-                   (uint64_t)fb->size, (uint64_t)IA64_VGA_FIXED_FB_SIZE);
         return false;
     }
 
@@ -1920,6 +1920,8 @@ static const IA64VpcCompatDefault ia64_vpc_compat_defaults[] = {
     /* Keep the VGA's EDID and the IA-64 VBE default at the legacy 1280x1024. */
     { "ati-vga", "xres", "1280" },
     { "ati-vga", "yres", "1024" },
+    { "geforce", "xres", "1280" },
+    { "geforce", "yres", "1024" },
     { "VGA", "xres", "1280" },
     { "VGA", "yres", "1024" },
     /*
@@ -2529,20 +2531,45 @@ static void ia64_vpc_configure_lsi(PCIDevice *pci_dev)
                              PCI_COMMAND_MASTER, 2);
 }
 
+static void ia64_vpc_get_vga_bar_indices(PCIDevice *dev,
+                                         int *fb_bar, int *mmio_bar)
+{
+    uint16_t vendor = pci_get_word(dev->config + PCI_VENDOR_ID);
+
+    if (vendor == 0x10DE) {
+        /* NVIDIA: BAR0 = MMIO registers, BAR1 = framebuffer */
+        *fb_bar = 1;
+        *mmio_bar = 0;
+    } else {
+        /* ATI / standard: BAR0 = framebuffer, BAR2 = MMIO */
+        *fb_bar = 0;
+        *mmio_bar = 2;
+    }
+}
+
 static void ia64_vpc_configure_vga(PCIDevice *pci_dev)
 {
+    int fb_bar, mmio_bar;
+
     if (pci_dev == NULL) {
         return;
     }
 
-    pci_default_write_config(pci_dev, PCI_BASE_ADDRESS_0,
+    ia64_vpc_get_vga_bar_indices(pci_dev, &fb_bar, &mmio_bar);
+
+    pci_default_write_config(pci_dev,
+                             PCI_BASE_ADDRESS_0 + fb_bar * 4,
                              IA64_VGA_FB_PCI_BASE, 4);
-    if (pci_dev->io_regions[1].memory != NULL) {
+    pci_default_write_config(pci_dev,
+                             PCI_BASE_ADDRESS_0 + mmio_bar * 4,
+                             IA64_VGA_MMIO_PCI_BASE, 4);
+
+    /* ATI exposes a separate I/O BAR at index 1. */
+    if (fb_bar != 1 && pci_dev->io_regions[1].memory != NULL) {
         pci_default_write_config(pci_dev, PCI_BASE_ADDRESS_0 + 4,
                                  IA64_VGA_IO_BASE, 4);
     }
-    pci_default_write_config(pci_dev, PCI_BASE_ADDRESS_0 + 8,
-                             IA64_VGA_MMIO_PCI_BASE, 4);
+
     pci_default_write_config(pci_dev, PCI_COMMAND,
                              PCI_COMMAND_IO | PCI_COMMAND_MEMORY, 2);
 
@@ -2700,13 +2727,15 @@ static void ia64_vpc_map_vga_fixed_windows(IA64VpcMachineState *s,
 {
     PCIIORegion *fb;
     PCIIORegion *mmio;
+    int fb_idx, mmio_idx;
 
     if (pci_dev == NULL) {
         return;
     }
 
-    fb = &pci_dev->io_regions[0];
-    mmio = &pci_dev->io_regions[2];
+    ia64_vpc_get_vga_bar_indices(pci_dev, &fb_idx, &mmio_idx);
+    fb = &pci_dev->io_regions[fb_idx];
+    mmio = &pci_dev->io_regions[mmio_idx];
     if (fb->memory == NULL || mmio->memory == NULL ||
         fb->address_space == NULL || mmio->address_space == NULL) {
         return;
@@ -2717,9 +2746,12 @@ static void ia64_vpc_map_vga_fixed_windows(IA64VpcMachineState *s,
     }
 
     if (s->vga_fb_alias == NULL) {
+        uint64_t fb_alias_size = MIN(fb->size, IA64_VGA_FIXED_FB_SIZE);
+
         s->vga_fb_alias = g_new(MemoryRegion, 1);
         memory_region_init_alias(s->vga_fb_alias, OBJECT(s),
-                                 "ia64-vga-fb-fixed", fb->memory, 0, fb->size);
+                                 "ia64-vga-fb-fixed", fb->memory, 0,
+                                 fb_alias_size);
         memory_region_add_subregion_overlap(fb->address_space,
                                             IA64_VGA_FB_PCI_BASE,
                                             s->vga_fb_alias, 1);
@@ -2842,6 +2874,62 @@ static void ia64_vpc_reset(void *opaque)
 #endif
 }
 
+#ifdef CONFIG_IA64_VPC_GRAPHICS
+static PCIDevice *ia64_vpc_find_user_vga(PCIBus *bus)
+{
+    PCIDevice *dev;
+    unsigned int slot;
+
+    for (slot = 0; slot < PCI_SLOT_MAX; slot++) {
+        dev = pci_find_device(bus, 0, PCI_DEVFN(slot, 0));
+        if (dev != NULL &&
+            pci_get_word(dev->config + PCI_CLASS_DEVICE) ==
+            PCI_CLASS_DISPLAY_VGA) {
+            return dev;
+        }
+    }
+    return NULL;
+}
+
+static void ia64_vpc_adopt_user_vga(IA64VpcMachineState *s)
+{
+    Error *local_err = NULL;
+    PCIDevice *vga;
+    MemoryRegion *pci_io;
+
+    if (s->vga_dev != NULL || s->pci_bus == NULL) {
+        return;
+    }
+
+    vga = ia64_vpc_find_user_vga(s->pci_bus);
+    if (vga == NULL) {
+        return;
+    }
+
+    if (!ia64_vpc_prepare_vga_properties(s, vga, &local_err)) {
+        warn_report_err(local_err);
+        return;
+    }
+    s->vga_dev = vga;
+
+    if (!ia64_vpc_build_vbe_config(s, &local_err)) {
+        warn_report_err(local_err);
+        s->vga_dev = NULL;
+        return;
+    }
+
+    ia64_vpc_enable_vga_legacy_switch(s->vga_dev, &local_err);
+    if (local_err) {
+        warn_report_err(local_err);
+    }
+
+    ia64_vpc_map_vga_fixed_windows(s, s->vga_dev);
+
+    pci_io = s->pci_bus->address_space_io;
+    ia64_vpc_init_int10(s, pci_io);
+}
+#endif
+
 /*
  * Machine-done notifier — runs after the first reset cycle completes,
  * so ROM content is guaranteed to be in guest memory.  Parse a firmware
@@ -2857,6 +2945,9 @@ static void ia64_vpc_machine_done(Notifier *notifier, void *data)
     CPUState *cs;
 
     (void)data;
+#ifdef CONFIG_IA64_VPC_GRAPHICS
+    ia64_vpc_adopt_user_vga(s);
+#endif
     ia64_vpc_configure_platform_pci(s);
 
     if (!machine->firmware || s->firmware_size == 0) {
@@ -3046,6 +3137,7 @@ static bool ia64_vpc_build(MachineState *machine, Error **errp)
         return false;
     }
     pci_bus = PCI_BUS(qdev_get_child_bus(pci_host, "pci"));
+    s->pci_bus = pci_bus;
 
     /*
      * Slot 0 is intentionally empty.  When AHCI is omitted, reserve its

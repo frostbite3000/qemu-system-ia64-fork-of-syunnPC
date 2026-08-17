@@ -30,6 +30,7 @@
 #include "hw/pci/pci.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/i2c/i2c.h"
+#include "hw/display/edid.h"
 #include "migration/vmstate.h"
 #include "ui/console.h"
 #include "vga_regs.h"
@@ -2108,6 +2109,7 @@ static const VMStateDescription gf_vmstate = {
 
 static const Property gf_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", GeForceState, vga.vram_size_mb, 64),
+    DEFINE_EDID_PROPERTIES(GeForceState, i2cddc.edid_info),
 };
 
 static void gf_class_init(ObjectClass *klass, const void *data)
